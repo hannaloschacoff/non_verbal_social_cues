@@ -1,0 +1,1280 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGazer + Radar (p5)</title>
+  <script src="https://webgazer.cs.brown.edu/webgazer.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.6.0/p5.min.js"></script>
+  <style>
+    html,body { margin: 0; height: 100%; overflow: hidden; font-family: 'Inconsolata', monospace; }
+    body { background: #222; color: #111; }
+    #controls { position: fixed; left: 8px; top: 8px; z-index: 30000; font-family: 'Inconsolata', monospace; }
+    button { margin-right: 6px; margin-bottom: 4px; font-family: 'Inconsolata', monospace; }
+    #info, #calibStatus { font-family: 'Inconsolata', monospace; }
+
+    canvas { display: block; z-index: 100 !important; position: absolute !important; background: transparent; pointer-events: none; }
+
+    #webgazerVideoContainer,
+    video#webgazerVideoFeed,
+    canvas#webgazerFaceOverlay,
+    canvas#webgazerPredictionPoints {
+      position: absolute !important;
+      left: 0 !important;
+      top: 0 !important;
+      z-index: 1000 !important;
+      object-fit: cover;
+      pointer-events: none;
+      display: block !important;
+      visibility: visible !important;
+    }
+
+    video#webgazerVideoFeed { 
+      opacity: 0.6 !important; 
+      filter: none !important;
+    }
+
+    canvas#webgazerFaceOverlay {
+      opacity: 1 !important;
+      filter: grayscale(1) brightness(2.2) contrast(1.2) !important;
+      z-index: 1100 !important;
+      pointer-events: none !important;
+    }
+
+    #webgazerPredictionPoints,
+    #webgazerPredictionPoints *,
+    .webgazerPredictionPoint,
+    .predictionPoint {
+      display: none !important;
+      visibility: hidden !important;
+      opacity: 0 !important;
+    }
+
+    #webgazerFaceFeedbackBox,
+    .webgazerFaceFeedbackBox {
+      display: none !important;
+      visibility: hidden !important;
+      opacity: 0 !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="startGaze">Start Gaze</button>
+    <button id="calibrate" style="display:none;">Calibrate</button>
+    <button id="resetCalibration" style="display:none;">Reset Calibration</button>
+    <button id="pauseRobot" style="display:none;">Pause Robot (Calibration Mode)</button>
+    <br>
+    <span id="info">WS: disconnected</span>
+    <span id="calibStatus" style="margin-left: 10px; color: #ffdc00;"></span>
+  </div>
+
+  <script>
+    const WS_ADDR = 'ws://localhost:8765';
+    let ws;
+    let robotPaused = false;
+
+    let robotState = "WAITING_APPROACH";
+    let gazeFollowCount = 0;
+    
+    function connectWS() {
+      ws = new WebSocket(WS_ADDR);
+      ws.onopen = () => { 
+        document.getElementById('info').textContent = 'WS: open';
+        document.getElementById('pauseRobot').style.display = 'inline-block';
+        console.log('✓ WebSocket connected to', WS_ADDR);
+      };
+      ws.onclose = () => { 
+        document.getElementById('info').textContent = 'WS: closed'; 
+        console.log('WebSocket closed, reconnecting...');
+        setTimeout(connectWS,1000); 
+      };
+      ws.onerror = (e) => console.warn('WS error', e);
+      ws.onmessage = ev => { 
+        try { 
+          const m = JSON.parse(ev.data); 
+          if (m.type === 'radar') {
+            window._lastRadarLine = m.data;
+          } else if (m.type === 'state') {
+
+            // update roboot state from server
+            robotState = m.data;
+            console.log('Robot state changed to:', robotState);
+          } else if (m.type === 'gazeFollowCount') {
+
+            // update gaze follow count from server
+            gazeFollowCount = m.data;
+            console.log('Gaze follow count:', gazeFollowCount);
+          }
+        } catch(e){
+          console.error('Error parsing WebSocket message:', e);
+        } 
+      };
+    }
+    connectWS();
+
+    document.getElementById('pauseRobot').addEventListener('click', () => {
+      robotPaused = !robotPaused;
+      const btn = document.getElementById('pauseRobot');
+      
+      if (robotPaused) {
+        btn.textContent = 'Resume Robot';
+        btn.style.background = '#ff6600';
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'control', data: 'PAUSE' }));
+        }
+      } else {
+        btn.textContent = 'Pause Robot (Calibration Mode)';
+        btn.style.background = '';
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'control', data: 'RESUME' }));
+        }
+      }
+    });
+
+    let gazeLatest = null;
+    let gazeRawX = 0, gazeRawY = 0;
+    let gazeH = "Center", gazeV = "Center";
+    let gazeTrail = [];
+    const GAZE_TRAIL_MAX = 60;
+    
+    let gazeMatrix = {
+      'Left_Up': 0, 'Center_Up': 0, 'Right_Up': 0,
+      'Left_Center': 0, 'Center_Center': 0, 'Right_Center': 0,
+      'Left_Down': 0, 'Center_Down': 0, 'Right_Down': 0
+    };
+    
+    function checkCalibrationStatus() {
+      const calibData = localStorage.getItem('webgazerCalibration');
+      const calibStatusEl = document.getElementById('calibStatus');
+      
+      if (calibData) {
+        calibStatusEl.textContent = 'Calibration loaded';
+        calibStatusEl.style.color = '#00ff00';
+        return true;
+      } else {
+        calibStatusEl.textContent = 'No calibration found';
+        calibStatusEl.style.color = '#ffaa00';
+        return false;
+      }
+    }
+
+    async function startWebGazer() {
+      webgazer.setRegression('ridge');
+      webgazer.showVideo(true);
+      webgazer.showFaceOverlay(true);
+      webgazer.showPredictionPoints(false);
+      webgazer.showFaceFeedbackBox(false);
+      webgazer.setGazeListener((data,ts)=>{
+        if(!data) return;
+        gazeRawX = data.x;
+        gazeRawY = data.y;
+        gazeLatest = {x:data.x,y:data.y,ts};
+        updateGazeDirs();
+        gazeTrail.push({x: data.x, y: data.y, ts});
+        if (gazeTrail.length > GAZE_TRAIL_MAX) gazeTrail.shift();
+      });
+      
+      await webgazer.begin();
+      
+      const savedCalibration = localStorage.getItem('webgazerCalibration');
+      if (savedCalibration) {
+        try {
+          const calibData = JSON.parse(savedCalibration);
+          if (webgazer.getRegression() && calibData.ridgeData) {
+            const regression = webgazer.getRegression();
+            if (regression.setData) {
+              regression.setData(calibData.ridgeData);
+              console.log('Calibration data loaded from localStorage');
+              document.getElementById('calibStatus').textContent = 'Calibration restored';
+              document.getElementById('calibStatus').style.color = '#00ff00';
+            }
+          }
+        } catch(e) {
+          console.error('Failed to load calibration:', e);
+          document.getElementById('calibStatus').textContent = '⚠ Calibration load failed';
+        }
+      } else {
+        checkCalibrationStatus();
+      }
+      
+      positionWebgazerElements();
+      document.getElementById('calibrate').style.display = 'inline-block';
+      document.getElementById('resetCalibration').style.display = 'inline-block';
+    }
+    
+    document.getElementById('startGaze').addEventListener('click', async ()=> {
+      try { 
+        await startWebGazer(); 
+        document.getElementById('startGaze').textContent = 'Gaze started';
+      } catch(e){ 
+        console.error(e); 
+      }
+    });
+    
+    window.addEventListener('resize', () => positionWebgazerElements());
+
+    function positionWebgazerElements() {
+      let tries = 0, maxTries = 30;
+      const attempt = () => {
+        tries++;
+        const w = window.innerWidth; 
+        const h = Math.floor(window.innerHeight * 0.35);
+        const video = document.getElementById('webgazerVideoFeed') || document.querySelector('video');
+        const face = document.getElementById('webgazerFaceOverlay') || document.querySelector('canvas');
+        const pred = document.getElementById('webgazerPredictionPoints');
+
+        if (video) {
+          try { video.autoplay = true; video.playsInline = true; video.muted = true; } catch(e){}
+          video.style.left='0px'; video.style.top='0px';
+          video.style.width = w + 'px'; video.style.height = h + 'px';
+          video.style.objectFit = 'cover'; video.style.opacity = '0.6';
+          video.style.zIndex = '1000'; video.style.display='block'; video.style.visibility='visible';
+        }
+        
+        if (face) {
+          face.style.left='0px'; face.style.top='0px';
+          face.style.width = w + 'px'; face.style.height = h + 'px';
+          face.style.zIndex='1100'; face.style.pointerEvents='none'; 
+          face.style.display='block'; face.style.visibility='visible';
+        }
+        
+        if (pred) {
+          pred.style.display='none'; pred.style.visibility='hidden'; pred.style.opacity='0';
+        }
+
+        const feedbackBox = document.getElementById('webgazerFaceFeedbackBox') || document.querySelector('.webgazerFaceFeedbackBox');
+        if (feedbackBox) {
+          feedbackBox.style.display='none'; feedbackBox.style.visibility='hidden'; feedbackBox.style.opacity='0';
+        }
+
+        if ((video && face) || tries>=maxTries) return;
+        setTimeout(attempt, 200);
+      };
+      attempt();
+    }
+
+    function saveCalibration() {
+      try {
+        const regression = webgazer.getRegression();
+        if (regression && regression.getData) {
+          const calibData = {
+            ridgeData: regression.getData(),
+            timestamp: Date.now()
+          };
+          localStorage.setItem('webgazerCalibration', JSON.stringify(calibData));
+          console.log('✓ Calibration saved to localStorage');
+          setTimeout(() => {
+            document.getElementById('calibStatus').textContent = '✓ Calibration saved';
+            document.getElementById('calibStatus').style.color = '#00ff00';
+          }, 100);
+        }
+      } catch(e) {
+        console.error('Failed to save calibration:', e);
+      }
+    }
+
+    document.getElementById('calibrate').addEventListener('click', () => {
+      const pts = [
+        {x:0.1, y:0.1}, {x:0.5, y:0.1}, {x:0.9, y:0.1},
+        {x:0.1, y:0.5}, {x:0.4, y:0.5}, {x:0.5, y:0.5}, {x:0.6, y:0.5}, {x:0.9, y:0.5},
+        {x:0.1, y:0.9}, {x:0.5, y:0.9}, {x:0.9, y:0.9},
+        {x:0.5, y:0.3}, {x:0.5, y:0.7}
+      ];
+      let i = 0;
+      let clickCount = 0;
+      const CLICKS_PER_POINT = 5;
+      
+      const dot = document.createElement('div');
+      dot.id = 'calibrationDot';
+      dot.style.cssText = 'position:fixed; width:40px; height:40px; background:rgba(255,220,0,0.9); border:4px solid white; border-radius:50%; z-index:40000; cursor:pointer; box-shadow: 0 0 15px rgba(255,220,0,0.95); transition: transform 0.2s;';
+      document.body.appendChild(dot);
+
+      const instruction = document.createElement('div');
+      instruction.id = 'calibInstruction';
+      instruction.style.cssText = 'position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:rgba(0,0,0,0.8); color:white; padding:20px 40px; border-radius:10px; z-index:39999; font-size:18px; text-align:center; pointer-events:none; font-family: Inconsolata, monospace;';
+      instruction.innerHTML = 'Click each yellow dot 5 times<br>while looking at it<br><span style="font-size:14px; color:#ffdc00;">(Extra center points for better accuracy)</span>';
+      document.body.appendChild(instruction);
+
+      setTimeout(() => { if (instruction.parentNode) instruction.remove(); }, 4000);
+
+      function showNext() {
+        if (i >= pts.length) {
+          dot.remove();
+          if (instruction.parentNode) instruction.remove();
+          saveCalibration();
+          alert('Calibration complete and saved even after refreshing page.');
+          return;
+        }
+        
+        clickCount = 0;
+        const p = pts[i];
+        const cx = Math.round(p.x * window.innerWidth * 0.8);
+        const cy = Math.round(p.y * window.innerHeight * 0.35);
+        dot.style.left = (cx - 20) + 'px';
+        dot.style.top = (cy - 20) + 'px';
+        dot.style.transform = 'scale(1)';
+      }
+
+      dot.addEventListener('click', () => {
+        const rect = dot.getBoundingClientRect();
+        const cx = Math.round(rect.left + 20);
+        const cy = Math.round(rect.top + 20);
+        
+        if (webgazer && webgazer.recordScreenPosition) {
+          webgazer.recordScreenPosition(cx, cy);
+        }
+        
+        clickCount++;
+        dot.style.transform = 'scale(1.2)';
+        setTimeout(() => { dot.style.transform = 'scale(1)'; }, 150);
+        
+        if (clickCount >= CLICKS_PER_POINT) {
+          i++;
+          setTimeout(showNext, 300);
+        }
+      });
+
+      showNext();
+    });
+
+    document.getElementById('resetCalibration').addEventListener('click', () => {
+      if (confirm('Are you sure you want to clear the saved calibration? You will need to calibrate again.')) {
+        localStorage.removeItem('webgazerCalibration');
+        if (webgazer.getRegression()) { webgazer.clearData(); }
+        document.getElementById('calibStatus').textContent = 'No calibration, recalibrate';
+        document.getElementById('calibStatus').style.color = '#ff6600';
+        alert('Calibration cleared from storage. Please click "Calibrate" button to recalibrate.');
+      }
+    });
+
+    function updateGazeDirs() {
+      const w = window.innerWidth; 
+      const h = Math.floor(window.innerHeight * 0.35);
+      if (!gazeLatest) return;
+      let gx = Math.max(0, Math.min(w, gazeLatest.x));
+      let gy = Math.max(0, Math.min(h, gazeLatest.y));
+      const cx = w/2, cy = h/2; 
+      const dx = gx-cx, dy = gy-cy; 
+      const dead = 50;
+      gazeH = Math.abs(dx)<=dead ? "Center" : (dx>0?"Right":"Left");
+      gazeV = Math.abs(dy)<=dead ? "Center" : (dy>0?"Down":"Up");
+
+      const state = `${gazeH}_${gazeV}`;
+      if (gazeMatrix.hasOwnProperty(state)) {
+        gazeMatrix[state]++;
+      }
+
+      try { recordGazeSample(); } catch(e) {}
+    }
+
+    let gazeConclusion = "No data";
+    let gazeGlobalHistory = [];
+    let gazeGlobalValue = "No data";
+    const GAZE_ANALYSIS_MS = 500;
+    const GLOBAL_ANALYSIS_MS = 120000;
+
+    function recordGazeSample() {
+      if (!gazeH || !gazeV) return;
+      const state = `${gazeH}_${gazeV}`;
+      gazeConclusion = mapGazeToConclusion(state);
+    }
+
+    function mostCommon(arr) {
+      const counts = Object.create(null);
+      let best = null, bestCount = 0;
+      for (const v of arr) {
+        counts[v] = (counts[v] || 0) + 1;
+        if (counts[v] > bestCount) { best = v; bestCount = counts[v]; }
+      }
+      return best;
+    }
+
+    function mapGazeToConclusion(state) {
+      if (state === 'Center_Center') return 'paying attention';
+      if (state === 'Center_Up' || state === 'Center_Down') return 'paying attention';
+      if (state === 'Left_Up' || state === 'Left_Down') return 'distracted left';
+      if (state === 'Right_Up' || state === 'Right_Down') return 'distracted right';
+      if (state === 'Center_Left') return 'another person left';
+      if (state === 'Center_Right') return 'another person right';
+      if (state === 'Left_Center') return 'another person left';
+      if (state === 'Right_Center') return 'another person right';
+      return 'paying attention';
+    }
+
+    setInterval(() => {
+      if (robotPaused || !gazeConclusion || gazeConclusion === "No data") return;
+      gazeGlobalHistory.push(gazeConclusion);
+      if (ws && ws.readyState === 1 && !robotPaused) {
+        ws.send(JSON.stringify({ type: 'gaze', data: gazeConclusion }));
+        console.log('LIVE gaze:', gazeConclusion);
+      }
+      const info = document.getElementById('info');
+      if (info) info.textContent = `WS: ${ws && ws.readyState===1 ? 'open':'closed'}; — Gaze (LIVE): ${gazeConclusion}`;
+    }, GAZE_ANALYSIS_MS);
+
+    setInterval(() => {
+      if (gazeGlobalHistory.length === 0) return;
+      gazeGlobalValue = mostCommon(gazeGlobalHistory);
+      gazeGlobalHistory = [];
+    }, GLOBAL_ANALYSIS_MS);
+
+    let targetX=0,targetY=0,speed=0,acceleration=0;
+    let filteredX=0,filteredY=0,prevFilteredY=0;
+    let alpha=0.3;
+    let positionTrail=[], speedTrail=[], yDirectionTrail=[];
+    const maxTrailLength=10, movementThreshold=20;
+    const STILL_THRESHOLD = 8;
+    const FAST_SPEED = 25;
+    const SLOW_SPEED = 15;
+    
+    let behaviorType="Initializing...";
+    let movementStatus = "Unknown";
+    let analysisCount=0;
+    let behaviorGlobalHistory = [];
+    let behaviorGlobalValue = "Initializing...";
+    let currentZone = "Unknown";
+    window._lastRadarLine = null;
+
+    
+    let approachValence = "";
+
+    // history of radar trail data (showing how and where someone has walked)
+    let radarTrail = [];
+    const RADAR_TRAIL_MAX = 15;
+
+    setInterval(() => {
+      if (behaviorGlobalHistory.length === 0) return;
+      behaviorGlobalValue = mostCommon(behaviorGlobalHistory);
+      behaviorGlobalHistory = [];
+    }, GLOBAL_ANALYSIS_MS);
+
+    function calculateZone(distanceMM) {
+      const distanceCM = distanceMM / 10;
+      if (distanceCM <= 45) return "Intimate";
+      if (distanceCM <= 120) return "Personal";
+      if (distanceCM <= 370) return "Social";
+      return "Public";
+    }
+
+    new p5(p => {
+      let w,h;
+      const GAZE_HEIGHT_RATIO = 0.35;
+      const RADAR_HEIGHT_RATIO = 0.15;
+      const DECISION_HEIGHT_RATIO = 0.5;
+      const INFO_BOX_WIDTH_RATIO = 0.2;
+      
+      p.setup = ()=>{ 
+        p.createCanvas(window.innerWidth, window.innerHeight); 
+        p.textFont('Inconsolata',11); 
+        p.frameRate(60); 
+      };
+      
+      p.windowResized = ()=> p.resizeCanvas(window.innerWidth, window.innerHeight);
+
+      
+      document.addEventListener('fullscreenchange', () => {
+        setTimeout(() => {
+          p.resizeCanvas(window.innerWidth, window.innerHeight);
+          positionWebgazerElements();
+        }, 100);
+      });
+
+      function computeMean(arr){ if(!arr.length) return 0; return arr.reduce((a,b)=>a+b,0)/arr.length; }
+
+      function analyzeBehaviorLocal(){
+        const N = positionTrail.length;
+        if(N < 2) return;
+        
+        const avgSpeed = computeMean(speedTrail);
+        const allSpeeds = speedTrail.filter(s => !isNaN(s));
+        const stillCount = allSpeeds.filter(s => Math.abs(s) < STILL_THRESHOLD).length;
+        const stillRatio = stillCount / allSpeeds.length;
+        
+        if (stillRatio > 0.7) {
+          movementStatus = "Standing Still";
+          behaviorType = "Standing Still";
+          console.log('Person is standing still (speed ratio: ' + stillRatio.toFixed(2) + ')');
+          positionTrail = []; speedTrail = []; yDirectionTrail = [];
+          return;
+        }
+        
+        movementStatus = "Moving";
+        const first = positionTrail[0], last = positionTrail[N-1];
+        const yChange = last.y - first.y;
+        const towards = yChange < -30;
+        const away = yChange > 30;
+        
+        let emotion = "Neutral";
+        const speedVal = Math.abs(avgSpeed);
+        
+        if (towards) {
+          if (speedVal > FAST_SPEED) {
+            emotion = "Angry";
+            console.log('ANGRY: Fast movement towards (speed: ' + speedVal.toFixed(1) + ', Y change: ' + yChange.toFixed(0) + ')');
+          } else {
+            emotion = "Curious";
+            console.log('CURIOUS: Slow movement towards (speed: ' + speedVal.toFixed(1) + ', Y change: ' + yChange.toFixed(0) + ')');
+          }
+        } else if (away) {
+          if (speedVal > FAST_SPEED) {
+            emotion = "Scared";
+            console.log('SCARED: Fast movement away (speed: ' + speedVal.toFixed(1) + ', Y change: ' + yChange.toFixed(0) + ')');
+          } else {
+            emotion = "Uncomfortable";
+            console.log('UNCOMFORTABLE: Slow movement away (speed: ' + speedVal.toFixed(1) + ', Y change: ' + yChange.toFixed(0) + ')');
+          }
+        } else {
+          emotion = "Neutral";
+          console.log('NEUTRAL: No clear direction (speed: ' + speedVal.toFixed(1) + ', Y change: ' + yChange.toFixed(0) + ')');
+        }
+
+        behaviorType = emotion;
+        behaviorGlobalHistory.push(emotion);
+        analysisCount++;
+        
+        if (ws && ws.readyState === 1 && !robotPaused) {
+          ws.send(JSON.stringify({ type: 'proxemics', data: behaviorType }));
+          console.log('→ Browser sent proxemics:', behaviorType);
+        }
+        
+        positionTrail = []; speedTrail = []; yDirectionTrail = [];
+      }
+
+      function getActiveSensor() {
+        if (robotState === "WAITING_APPROACH" || robotState === "CHECKING_MOVEMENT") {
+          return "radar";
+        } else if (robotState === "GAZE_FOLLOWING" || robotState === "SURPRISE_REACTION" || robotState === "REJECTION_HOLD") {
+          return "gaze";
+        }
+        return "none";
+      }
+
+      function drawDecisionBox(x, y, w, h, label, color, isActive, content = []) {
+        p.push();
+        
+        p.noStroke();
+        p.fill(0, 0, 0, 20);
+        p.rect(x + 3, y + 3, w, h, 8);
+        
+        p.stroke(isActive ? p.color(255, 220, 0) : p.color(100, 100, 100));
+        p.strokeWeight(isActive ? 4 : 2);
+        p.fill(isActive ? p.color(255, 220, 0, 40) : p.color(100, 100, 100));
+        p.rect(x, y, w, h, 8);
+        
+        p.noStroke();
+        p.fill(255, 220, 0);
+        p.rect(x, y, w, 30, 8, 8, 0, 0);
+        
+        p.fill(0);
+        p.textSize(13);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textStyle(p.BOLD);
+        p.text(label, x + w/2, y + 13);
+        p.textStyle(p.NORMAL);
+        
+        p.fill(255);
+        p.textSize(11);
+        let yOffset = y + 40;
+        for (let line of content) {
+          p.text(line, x + w/2, yOffset);
+          yOffset += 16;
+        }
+        p.pop();
+      }
+
+      function drawDiamond(x, y, size, label, sublabel = "") {
+        p.push();
+        
+        p.noStroke();
+        p.fill(0, 0, 0, 20);
+        p.translate(x + 2, y + 2);
+        p.rotate(p.PI/4);
+        p.rect(-size/2, -size/2, size, size, 4);
+        p.pop();
+        
+        p.push();
+        p.stroke(100, 100, 100);
+        p.strokeWeight(2);
+        p.fill(255, 250, 220);
+        p.translate(x, y);
+        p.rotate(p.PI/4);
+        p.rect(-size/2, -size/2, size, size, 4);
+        p.pop();
+        
+        p.fill(0);
+        p.textSize(9);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textStyle(p.BOLD);
+        p.text(label, x, y - 6);
+        if (sublabel) {
+          p.textStyle(p.NORMAL);
+          p.textSize(8);
+          p.text(sublabel, x, y + 6);
+        }
+        p.pop();
+      }
+
+      function drawArrow(x1, y1, x2, y2, label = "", curved = false) {
+        p.push();
+        p.stroke(100, 100, 100);
+        p.strokeWeight(2);
+        p.noFill();
+        
+        if (curved) {
+          p.bezier(x1, y1, (x1 + x2)/2, y1 - 30, (x1 + x2)/2, y2 - 30, x2, y2);
+        } else {
+          p.line(x1, y1, x2, y2);
+        }
+        
+        p.fill(100, 100, 100);
+        p.noStroke();
+        const angle = p.atan2(y2 - y1, x2 - x1);
+        p.push();
+        p.translate(x2, y2);
+        p.rotate(angle);
+        p.triangle(0, 0, -12, -6, -12, 6);
+        p.pop();
+        
+        if (label) {
+          p.fill(255);
+          p.stroke(0);
+          p.strokeWeight(3);
+          p.textSize(9);
+          p.textAlign(p.CENTER, p.CENTER);
+          p.textStyle(p.BOLD);
+          const midX = (x1 + x2) / 2;
+          const midY = curved ? ((y1 + y2) / 2) - 20 : (y1 + y2) / 2;
+          p.text(label, midX, midY - 10);
+        }
+        p.pop();
+      }
+
+      function drawLensBox(x, y, w, h, title) {
+        p.push();
+        
+        p.stroke(210, 210, 210);
+        p.strokeWeight(2);
+        p.fill(230, 230, 230);
+        p.rect(x, y, w, h, 8);
+        
+        p.noStroke();
+        p.fill(255, 220, 0);
+        p.rect(x, y, w, 30, 8, 8, 0, 0);
+        
+        p.fill(0);
+        p.textSize(14);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.textStyle(p.BOLD);
+        p.text(title, x + w/2, y + 15);
+        p.textStyle(p.NORMAL);
+        
+        p.pop();
+      }
+      
+      function drawDecisionNode(x, y, label, isActive) {
+        p.push();
+        
+        if (isActive) {
+          p.fill(255, 220, 0);
+          p.stroke(0);
+          p.strokeWeight(3);
+        } else {
+          p.fill(255);
+          p.stroke(100);
+          p.strokeWeight(2);
+        }
+        p.ellipse(x, y, 45, 45);
+        
+        p.fill(0);
+        p.noStroke();
+        p.textSize(11);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.text(label, x, y);
+        
+        p.pop();
+      }
+      
+      function drawConclusionNode(x, y, label, isActive, width = 140, height = 56) {
+        p.push();
+        
+        if (isActive) {
+          p.fill(255, 220, 0, 200);
+          p.stroke(0);
+          p.strokeWeight(3);
+        } else {
+          p.fill(240);
+          p.stroke(100);
+          p.strokeWeight(1.5);
+        }
+        p.rect(x - width/2, y - height/2, width, height, 5);
+        
+        p.fill(0);
+        p.noStroke();
+        p.textSize(9);
+        p.textAlign(p.CENTER, p.CENTER);
+        const lines = label.split('\n');
+        const lineHeight = 12;
+        const startY = y - ((lines.length - 1) * lineHeight) / 2;
+        for (let i = 0; i < lines.length; i++) {
+          p.text(lines[i], x, startY + i * lineHeight);
+        }
+        
+        p.pop();
+      }
+
+      function drawDecisionTree() {
+        const startY = h * (GAZE_HEIGHT_RATIO + RADAR_HEIGHT_RATIO) + 10;
+        const margin = 20;
+        const interpretWidth = (w * 2/3) - margin * 2;
+        const gazeInterpretHeight = (h * DECISION_HEIGHT_RATIO) * 0.55 - 5;
+        const radarInterpretHeight = (h * DECISION_HEIGHT_RATIO) * 0.45 - 5;
+        const actionWidth = (w * 1/3) - margin * 2;
+        const actionHeight = h * DECISION_HEIGHT_RATIO - 10;
+        
+        const DECISION_TREE_SCALE = 0.75;
+        const ACTION_SCALE = 1.2;
+        const ACTION_Y_OFFSET = 200;
+        
+        p.push();
+        
+        const boxStartY = startY;
+        
+
+        // gaze interpretation lens
+        const gazeX = margin;
+        const gazeY = boxStartY;
+        drawLensBox(gazeX, gazeY, interpretWidth, gazeInterpretHeight, "Interpretation of Human Gaze");
+        
+        const gazeTreeY = gazeY + gazeInterpretHeight / 2;
+        const layer1X = gazeX + 35 * DECISION_TREE_SCALE;
+        const layer2X = layer1X + 180 * DECISION_TREE_SCALE;
+        const layer3X = layer2X + 380 * DECISION_TREE_SCALE;
+        
+        // horizontal direction legend - bottom left
+        p.fill(0); p.textSize(10); p.textAlign(p.LEFT, p.BOTTOM);
+        p.textStyle(p.BOLD);
+        p.text("Horizontal", gazeX + 10, gazeY + gazeInterpretHeight - 20);
+        p.text("Vertical Direction", gazeX + 100, gazeY + gazeInterpretHeight - 20);
+        
+
+        // interpretation legend - bottom right
+        p.textAlign(p.RIGHT, p.BOTTOM);
+        p.text("Interpretation", gazeX + interpretWidth - 195, gazeY + gazeInterpretHeight - 20);
+        p.textStyle(p.NORMAL);
+        
+        const v1Up = gazeTreeY - 185 * DECISION_TREE_SCALE; //145
+        const v1Center = gazeTreeY;
+        const v1Down = gazeTreeY + 185 * DECISION_TREE_SCALE; //155
+        
+        drawDecisionNode(layer1X, v1Up, "Left", gazeH === "Left");
+        drawDecisionNode(layer1X, v1Center, "Center", gazeH === "Center");
+        drawDecisionNode(layer1X, v1Down, "Right", gazeH === "Right");
+        
+        // p.fill(0); p.textSize(10); p.textAlign(p.CENTER);
+        // p.textStyle(p.BOLD);
+        // p.text("Vertical Direction", layer2X - 100 * DECISION_TREE_SCALE, gazeTreeY - 90 * DECISION_TREE_SCALE);
+        // p.text("Direction", layer2X - 100 * DECISION_TREE_SCALE, gazeTreeY - 72 * DECISION_TREE_SCALE);
+        
+        const vOffset = 60 * DECISION_TREE_SCALE;
+        const hOffset = 60 * DECISION_TREE_SCALE;
+        
+        // p.textAlign(p.CENTER, p.TOP);
+        drawDecisionNode(layer2X - hOffset, v1Up - vOffset, "Up", gazeH === "Left" && gazeV === "Up");
+        drawDecisionNode(layer2X, v1Up, "Center", gazeH === "Left" && gazeV === "Center");
+        drawDecisionNode(layer2X - hOffset, v1Up + vOffset, "Down", gazeH === "Left" && gazeV === "Down");
+        
+        drawDecisionNode(layer2X - hOffset, v1Center - vOffset, "Up", gazeH === "Center" && gazeV === "Up");
+        drawDecisionNode(layer2X, v1Center, "Center", gazeH === "Center" && gazeV === "Center");
+        drawDecisionNode(layer2X - hOffset, v1Center + vOffset, "Down", gazeH === "Center" && gazeV === "Down");
+        
+        drawDecisionNode(layer2X - hOffset, v1Down - vOffset, "Up", gazeH === "Right" && gazeV === "Up");
+        drawDecisionNode(layer2X, v1Down, "Center", gazeH === "Right" && gazeV === "Center");
+        drawDecisionNode(layer2X - hOffset, v1Down + vOffset, "Down", gazeH === "Right" && gazeV === "Down");
+        
+        p.stroke(100); p.strokeWeight(1.5);
+        p.line(layer1X + 23, v1Up, layer2X - hOffset - 23, v1Up - vOffset);
+        p.line(layer1X + 23, v1Up, layer2X - 23, v1Up);
+        p.line(layer1X + 23, v1Up, layer2X - hOffset - 23, v1Up + vOffset);
+        
+        p.line(layer1X + 23, v1Center, layer2X - hOffset - 23, v1Center - vOffset);
+        p.line(layer1X + 23, v1Center, layer2X - 23, v1Center);
+        p.line(layer1X + 23, v1Center, layer2X - hOffset - 23, v1Center + vOffset);
+        
+        p.line(layer1X + 23, v1Down, layer2X - hOffset - 23, v1Down - vOffset);
+        p.line(layer1X + 23, v1Down, layer2X - 23, v1Down);
+        p.line(layer1X + 23, v1Down, layer2X - hOffset - 23, v1Down + vOffset);
+        
+        // Draw larger conclusion nodes
+        p.textAlign(p.CENTER, p.TOP);
+        drawConclusionNode(layer3X, v1Up - vOffset, "Distracted by something on the left", gazeConclusion === "distracted left", 180, 56);
+        drawConclusionNode(layer3X, v1Up, "Another person on their left?", gazeConclusion === "another person left", 180, 56);
+        drawConclusionNode(layer3X, v1Up + vOffset, "Distracted by something on the left", gazeConclusion === "distracted left", 180, 56);
+        
+        drawConclusionNode(layer3X, v1Center - vOffset, "Paying Attention", gazeConclusion === "paying attention", 180, 56);
+        drawConclusionNode(layer3X, v1Center, "Paying Attention", gazeConclusion === "paying attention", 180, 56);
+        drawConclusionNode(layer3X, v1Center + vOffset, "Paying Attention", gazeConclusion === "paying attention", 180, 56);
+        
+        drawConclusionNode(layer3X, v1Down - vOffset, "Distracted by something on the right", gazeConclusion === "distracted right", 180, 56);
+        drawConclusionNode(layer3X, v1Down, "Another person on their right?", gazeConclusion === "another person right", 180, 56);
+        drawConclusionNode(layer3X, v1Down + vOffset, "Distracted by something on the right", gazeConclusion === "distracted right", 180, 56);
+        
+        for (let i = -1; i <= 1; i++) {
+          let yOffset = i * vOffset;
+          p.line(layer2X + (i === 0 ? 23 : -hOffset + 23), v1Up + yOffset, layer3X - 90, v1Up + yOffset);
+          p.line(layer2X + (i === 0 ? 23 : -hOffset + 23), v1Center + yOffset, layer3X - 90, v1Center + yOffset);
+          p.line(layer2X + (i === 0 ? 23 : -hOffset + 23), v1Down + yOffset, layer3X - 90, v1Down + yOffset);
+        }
+        
+        // radar interpretation lenss
+
+        const radarX = margin;
+        const radarY = gazeY + gazeInterpretHeight + 5;
+        drawLensBox(radarX, radarY, interpretWidth, radarInterpretHeight, "Interpretation of Human Walking");
+        
+        const radarTreeY = radarY + radarInterpretHeight / 2;
+        const r_layer1X = radarX + 179 * DECISION_TREE_SCALE;
+        const r_layer2X = r_layer1X + 150 * DECISION_TREE_SCALE;
+        const r_layer3X = r_layer2X + 265 * DECISION_TREE_SCALE;
+        
+        const r1Up = radarTreeY - 105 * DECISION_TREE_SCALE;
+        const r1Center = radarTreeY;
+        const r1Down = radarTreeY + 155 * DECISION_TREE_SCALE;
+        
+        const isStill = movementStatus === "Standing Still";
+        const isForward = !isStill && speed < 0;
+        const isAway = !isStill && speed > 0;
+        
+        p.fill(0); p.textSize(11); p.textAlign(p.CENTER);
+        // p.text("Movement", r_layer1X, radarTreeY - 150 * DECISION_TREE_SCALE);
+        p.text("Direction", r_layer1X , radarTreeY - 170 * DECISION_TREE_SCALE);
+        
+        drawDecisionNode(r_layer1X, r1Up, "Still", isStill);
+        drawDecisionNode(r_layer1X, r1Center, "Forward", isForward);
+        drawDecisionNode(r_layer1X, r1Down, "Away", isAway);
+        
+        p.fill(0); p.textSize(11);
+        // p.text("Speed /", r_layer2X, radarTreeY - 180 * DECISION_TREE_SCALE);
+        p.text("Accel.", r_layer2X, radarTreeY - 170 * DECISION_TREE_SCALE);
+        
+        drawDecisionNode(r_layer2X, r1Up, "None", isStill);
+        
+        const r_vOffset = 40 * DECISION_TREE_SCALE;
+        const r_hOffset = 0 * DECISION_TREE_SCALE;
+        
+        drawDecisionNode(r_layer2X - r_hOffset, r1Center - r_vOffset, "Slow", isForward && Math.abs(speed) <= SLOW_SPEED);
+        drawDecisionNode(r_layer2X - r_hOffset, r1Center + r_vOffset, "Fast", isForward && Math.abs(speed) > FAST_SPEED);
+        
+        drawDecisionNode(r_layer2X - r_hOffset, r1Down - r_vOffset, "Slow", isAway && Math.abs(speed) <= SLOW_SPEED);
+        drawDecisionNode(r_layer2X - r_hOffset, r1Down + r_vOffset, "Fast", isAway && Math.abs(speed) > FAST_SPEED);
+        
+        p.stroke(100); p.strokeWeight(1.5);
+        p.line(r_layer1X + 23, r1Up, r_layer2X - 23, r1Up);
+        
+        p.line(r_layer1X + 23, r1Center, r_layer2X - r_hOffset - 23, r1Center - r_vOffset);
+        p.line(r_layer1X + 23, r1Center, r_layer2X - r_hOffset - 23, r1Center + r_vOffset);
+        
+        p.line(r_layer1X + 23, r1Down, r_layer2X - r_hOffset - 23, r1Down - r_vOffset);
+        p.line(r_layer1X + 23, r1Down, r_layer2X - r_hOffset - 23, r1Down + r_vOffset);
+        
+        p.fill(0); p.textSize(11);
+        p.text("Interpretation", r_layer3X, radarTreeY - 170 * DECISION_TREE_SCALE);
+        
+        drawConclusionNode(r_layer3X, r1Up, "No Change\nin State", behaviorType === "Standing Still", 116, 46);
+        
+        drawConclusionNode(r_layer3X, r1Center - r_vOffset, "Curious", behaviorType === "Curious", 116, 46);
+        drawConclusionNode(r_layer3X, r1Center + r_vOffset, "Angry", behaviorType === "Angry", 116, 46);
+        
+        drawConclusionNode(r_layer3X, r1Down - r_vOffset, "Uncomfortable", behaviorType === "Uncomfortable", 116, 46);
+        drawConclusionNode(r_layer3X, r1Down + r_vOffset, "Scared", behaviorType === "Scared", 116, 46);
+        
+        p.line(r_layer2X + 23, r1Up, r_layer3X - 58, r1Up);
+        p.line(r_layer2X - r_hOffset + 23, r1Center - r_vOffset, r_layer3X - 58, r1Center - r_vOffset);
+        p.line(r_layer2X - r_hOffset + 23, r1Center + r_vOffset, r_layer3X - 58, r1Center + r_vOffset);
+        p.line(r_layer2X - r_hOffset + 23, r1Down - r_vOffset, r_layer3X - 58, r1Down - r_vOffset);
+        p.line(r_layer2X - r_hOffset + 23, r1Down + r_vOffset, r_layer3X - 58, r1Down + r_vOffset);
+        
+        // interaction loop action
+
+        const actionX = gazeX + interpretWidth + margin;
+        drawLensBox(actionX, boxStartY, actionWidth, actionHeight, "Action");
+        
+        const actionContentY = boxStartY + 50 + ACTION_Y_OFFSET;
+        const stateBoxW = 100 * ACTION_SCALE;
+        const stateBoxH = 60 * ACTION_SCALE;
+        const flowY = actionContentY + 20 * ACTION_SCALE;
+        
+        const states = [
+          { 
+            name: "WAITING", 
+            y: flowY,
+            detail: "Radar active\nDetect approach"
+          },
+          { 
+            name: "GAZE\nFOLLOW", 
+            y: flowY + 80 * ACTION_SCALE,
+            detail: `${gazeFollowCount}/10\n${gazeFollowCount < 5 ? 'Slow' : 'Fast'}`
+          },
+          { 
+            name: "REJECTION", 
+            y: flowY + 160 * ACTION_SCALE,
+            detail: "Turn 180°\nHold 4-10s"
+          },
+          { 
+            name: "SURPRISE", 
+            y: flowY + 240 * ACTION_SCALE,
+            detail: "Fast shake\n3x ±40°"
+          },
+          { 
+            name: "CHECKING", 
+            y: flowY + 320 * ACTION_SCALE,
+            detail: "Analyze\nServo trigger"
+          }
+        ];
+        
+        const stateX = actionX + actionWidth / 2;
+        
+        for (let i = 0; i < states.length; i++) {
+          const state = states[i];
+          const isActive = 
+            (state.name === "WAITING" && robotState === "WAITING_APPROACH") ||
+            (state.name === "GAZE\nFOLLOW" && robotState === "GAZE_FOLLOWING") ||
+            (state.name === "REJECTION" && robotState === "REJECTION_HOLD") ||
+            (state.name === "SURPRISE" && robotState === "SURPRISE_REACTION") ||
+            (state.name === "CHECKING" && robotState === "CHECKING_MOVEMENT");
+          
+          p.push();
+          if (isActive) {
+            p.fill(255, 220, 0);
+            p.stroke(0);
+            p.strokeWeight(3);
+          } else {
+            p.fill(240);
+            p.stroke(100);
+            p.strokeWeight(2);
+          }
+          p.rect(stateX - stateBoxW/2, state.y - stateBoxH/2, stateBoxW, stateBoxH, 5);
+          
+          p.fill(0);
+          p.noStroke();
+          p.textSize(10 * ACTION_SCALE);
+          p.textAlign(p.CENTER, p.CENTER);
+          p.textStyle(p.BOLD);
+          const lines = state.name.split('\n');
+          if (lines.length === 1) {
+            p.text(state.name, stateX, state.y - 12 * ACTION_SCALE);
+          } else {
+            p.text(lines[0], stateX, state.y - 18 * ACTION_SCALE);
+            p.text(lines[1], stateX, state.y - 8 * ACTION_SCALE);
+          }
+          
+          p.textStyle(p.NORMAL);
+          p.textSize(8 * ACTION_SCALE);
+          const detailLines = state.detail.split('\n');
+          for (let j = 0; j < detailLines.length; j++) {
+            p.text(detailLines[j], stateX, state.y + (8 + j * 10) * ACTION_SCALE);
+          }
+          p.pop();
+          
+          if (i < states.length - 1) {
+            p.stroke(100);
+            p.strokeWeight(2);
+            p.fill(100);
+            const arrowStartY = state.y + stateBoxH/2;
+            const arrowEndY = states[i + 1].y - stateBoxH/2;
+            p.line(stateX, arrowStartY, stateX, arrowEndY);
+            
+            p.noStroke();
+            p.triangle(stateX, arrowEndY, stateX - 5, arrowEndY - 8, stateX + 5, arrowEndY - 8);
+          }
+        }
+        
+        p.stroke(0, 150, 0);
+        p.strokeWeight(2);
+        p.noFill();
+        p.arc(stateX + 60 * ACTION_SCALE, flowY + 200 * ACTION_SCALE, 80 * ACTION_SCALE, 240 * ACTION_SCALE, -p.PI/2, p.PI/2);
+        p.fill(0, 150, 0);
+        p.noStroke();
+        p.triangle(
+          stateX + 60 * ACTION_SCALE, 
+          flowY + (80 + 30) * ACTION_SCALE, 
+          stateX + 55 * ACTION_SCALE, 
+          flowY + (80 + 38) * ACTION_SCALE, 
+          stateX + 65 * ACTION_SCALE, 
+          flowY + (80 + 38) * ACTION_SCALE
+        );
+        
+        p.stroke(200, 0, 0);
+        p.strokeWeight(2);
+        p.noFill();
+        p.arc(stateX - 60 * ACTION_SCALE, flowY + 160 * ACTION_SCALE, 80 * ACTION_SCALE, 320 * ACTION_SCALE, p.PI/2, -p.PI/2);
+        p.fill(200, 0, 0);
+        p.noStroke();
+        p.triangle(
+          stateX - 60 * ACTION_SCALE, 
+          flowY, 
+          stateX - 65 * ACTION_SCALE, 
+          flowY - 8, 
+          stateX - 55 * ACTION_SCALE, 
+          flowY - 8
+        );
+        
+        p.pop();
+      }
+
+      p.draw = () => {
+        p.clear();
+        w = p.width;
+        h = p.height;
+        
+        const gazeHeight = h * GAZE_HEIGHT_RATIO;
+        const radarHeight = h * RADAR_HEIGHT_RATIO;
+        const decisionHeight = h * DECISION_HEIGHT_RATIO;
+        
+        const infoBoxW = w * INFO_BOX_WIDTH_RATIO;
+        const gazeVisW = w - infoBoxW - 20;
+        
+        const activeSensor = getActiveSensor();
+
+        // gaze camera stream
+
+        p.push();
+        p.fill(100, 100, 100);
+        p.noStroke();
+        p.rect(0, 0, w, gazeHeight);
+        
+        if (activeSensor === "gaze") {
+          p.stroke(255, 220, 0);
+          p.strokeWeight(6);
+          p.noFill();
+          p.rect(3, 3, w - 6, gazeHeight - 6);
+        }
+        
+        p.stroke(210, 210, 210);
+        p.strokeWeight(2);
+        p.fill(230, 230, 230);
+        p.rect(3, 3, infoBoxW - 6, gazeHeight - 6, 8);
+        p.fill(0); p.noStroke();
+        p.textSize(16); p.textAlign(p.LEFT, p.TOP);
+        p.text("Raw Gaze", 10, 10);
+        p.textSize(16);
+        p.text("Raw Data of Gaze " + gazeRawX.toFixed(0), 10, 52);
+        p.text("X: " + gazeRawX.toFixed(0), 10, 72);
+        p.text("Y: " + gazeRawY.toFixed(0), 10, 94);
+        p.text("H: " + gazeH, 10, 116);
+        p.text("V: " + gazeV, 10, 138);
+        
+        const gazeVisX = infoBoxW + 20;
+        p.stroke(210, 210, 210);
+        p.strokeWeight(2);
+        p.noFill();
+        p.rect(gazeVisX + 3, 3, gazeVisW - 26, gazeHeight - 6, 8);
+        
+        if (gazeTrail && gazeTrail.length > 0) {
+          const L = gazeTrail.length;
+          for (let i=0;i<L;i++){
+            const g = gazeTrail[i];
+            const px = p.constrain(g.x + gazeVisX, gazeVisX, w);
+            const py = p.constrain(g.y, 0, gazeHeight);
+            const alpha = p.map(i, 0, L-1, 60, 255);
+            p.noStroke(); p.fill(255, 220, 0, alpha);
+            const sz = p.map(i, 0, L-1, 4, 12);
+            p.ellipse(px, py, sz, sz);
+          }
+        }
+
+        if(gazeLatest){
+          const gx = p.constrain(gazeLatest.x + gazeVisX, gazeVisX, w);
+          const gy = p.constrain(gazeLatest.y, 0, gazeHeight);
+          const cx = gazeVisX + gazeVisW/2, cy = gazeHeight/2;
+          p.stroke(0,255,0); p.strokeWeight(2); 
+          p.line(cx-10,cy,cx+10,cy); p.line(cx,cy-10,cx,cy+10);
+          p.stroke(255,220,0); p.strokeWeight(3); p.line(cx,cy,gx,gy);
+          const angle = Math.atan2(gy-cy,gx-cx); const head = 12;
+          p.push(); p.translate(gx,gy); p.rotate(angle); p.noStroke(); 
+          p.fill(255,220,0); p.triangle(0,0,-head,head/2,-head,-head/2); 
+          p.pop();
+        }
+        
+        const gridSize = 140;
+        const cell = 36;
+        const gridX = w - gridSize - 16;
+        const gridY = gazeHeight - gridSize - 16;
+        p.push();
+        p.noStroke();
+        p.fill(200);
+        p.textSize(14);
+        p.textAlign(p.LEFT,p.TOP);
+        p.text("Gaze matrix", gridX, gridY - 35);
+        p.textSize(11);
+        const horizMap = { "Left":0, "Center":1, "Right":2 };
+        const vertMap = { "Up":0, "Center":1, "Down":2 };
+        const colIdx = horizMap[gazeH] !== undefined ? horizMap[gazeH] : 1;
+        const rowIdx = vertMap[gazeV] !== undefined ? vertMap[gazeV] : 1;
+        for(let r=0;r<3;r++){
+          for(let c=0;c<3;c++){
+            const x = gridX + c*(cell+6);
+            const y = gridY + r*(cell+6);
+            if(r===rowIdx && c===colIdx){
+              p.fill(255, 220, 0, 220);
+              p.noStroke();
+              p.rect(x,y,cell,cell,4);
+            } else {
+              p.noFill();
+              p.stroke(180);
+              p.strokeWeight(1);
+              p.rect(x,y,cell,cell,4);
+            }
+          }
+        }
+        p.noStroke(); p.fill(220); p.textSize(11);
+        p.textAlign(p.CENTER,p.BOTTOM); p.text("Left", gridX+cell-20, gridY-6);
+        p.textAlign(p.CENTER,p.TOP); p.text("Center", gridX+cell+25, gridY-18);
+        p.textAlign(p.CENTER,p.TOP); p.text("Right", gridX+cell+60, gridY-18);
+        p.textAlign(p.LEFT,p.CENTER); p.text("Up", gridX-28, gridY+cell/2);
+        p.text("Center", gridX-36, gridY+cell+6+cell/2);
+        p.text("Down", gridX-32, gridY+2*(cell+6)+cell/2);
+        p.pop();
+        
+        p.pop();
+
+        // radar visualization
+
+        p.push();
+        p.translate(0, gazeHeight);
+        p.fill(210, 210, 210);
+        p.noStroke();
+        p.rect(0, 0, w, radarHeight);
+        
+        if (activeSensor === "radar") {
+          p.stroke(255, 220, 0);
+          p.strokeWeight(6);
+          p.noFill();
+          p.rect(3, 3, w - 6, radarHeight - 6);
+        }
+        
+        p.stroke(210, 210, 210);
+        p.strokeWeight(2);
+        p.fill(230, 230, 230);
+        p.rect(3, 3, infoBoxW - 6, radarHeight - 6, 8);
+        p.fill(0); p.noStroke();
+        p.textSize(16); p.textAlign(p.LEFT, p.TOP); 
+        p.text("Raw Radar", 10, 10);
+        p.textSize(13); 
+        p.text("X: " + targetX.toFixed(1), 10, 28);
+        p.text("Y: " + targetY.toFixed(1), 10, 44);
+        p.text("Speed: " + speed.toFixed(1), 10, 60);
+        p.text("Acceleration: " + acceleration.toFixed(1), 10, 76);
+        p.text("Points: " + positionTrail.length, 10, 92);
+        p.text("Zone: " + currentZone, 10, 108);
+        
+        const radarVisX = infoBoxW + 20;
+        const radarVisW = w - infoBoxW - 20;
+        
+        p.stroke(210, 210, 210);
+        p.strokeWeight(2);
+        p.noFill();
+        p.rect(radarVisX + 3, 3, radarVisW - 26, radarHeight - 6, 8);
+        
+        const radarCenterX = radarVisX + radarVisW / 2;
+        const radarCenterY = radarHeight / 2 + 70;
+        const radarRadius = Math.min(radarHeight * 0.7, radarVisW * 0.36);
+        
+        p.push();
+        p.translate(radarCenterX, radarCenterY);
+        p.stroke(255); p.noFill(); p.strokeWeight(2);
+        for(let r=radarRadius/4;r<=radarRadius;r+=radarRadius/4) 
+          p.arc(0,0,r*2,r*2,p.PI,p.TWO_PI);
+        
+       
+        const maxMM=1500.0;
+        if (radarTrail.length > 0) {
+          for(let i=0;i<radarTrail.length;i++){
+            const pos=radarTrail[i];
+            const opacity=p.map(i,0,radarTrail.length-1,60,200);
+            const clampedX=p.constrain(pos.x,-maxMM,maxMM);
+            const clampedY=p.constrain(pos.y,0,maxMM);
+            const scaledX=p.map(clampedX,-maxMM,maxMM,-radarRadius,radarRadius);
+            const scaledY=p.map(clampedY,0,maxMM,0,-radarRadius);
+            p.fill(255, 220, 0, opacity); p.noStroke(); // #ffdc00 = rgb(255, 220, 0)
+            const sz = p.map(i, 0, radarTrail.length-1, 6, 14);
+            p.ellipse(scaledX,scaledY,sz,sz);
+          }
+        }
+        
+        // walking trail
+        for(let i=0;i<positionTrail.length;i++){
+          const pos=positionTrail[i];
+          const opacity=p.map(i,0,positionTrail.length,100,220);
+          const clampedX=p.constrain(pos.x,-maxMM,maxMM);
+          const clampedY=p.constrain(pos.y,0,maxMM);
+          const scaledX=p.map(clampedX,-maxMM,maxMM,-radarRadius,radarRadius);
+          const scaledY=p.map(clampedY,0,maxMM,0,-radarRadius);
+          p.fill(255,220,0,opacity); p.noStroke();
+          p.ellipse(scaledX,scaledY,12,12);
+        }
+        
+        if(positionTrail.length>0){
+          const last=positionTrail[positionTrail.length-1];
+          const clampedX=p.constrain(last.x,-maxMM,maxMM);
+          const clampedY=p.constrain(last.y,0,maxMM);
+          const sx=p.map(clampedX,-maxMM,maxMM,-radarRadius,radarRadius);
+          const sy=p.map(clampedY,0,maxMM,0,-radarRadius);
+          p.fill(0); p.noStroke();
+          p.ellipse(sx,sy,24,24);
+        }
+        p.pop();
+        
+        p.pop();
+
+        // decision tree
+
+        p.push();
+        p.fill(210, 210, 210);
+        p.noStroke();
+        p.rect(0, gazeHeight + radarHeight, w, decisionHeight);
+        drawDecisionTree();
+        p.pop();
+
+        // update radar data and trail
+        if(window._lastRadarLine){
+          const line = window._lastRadarLine; 
+          window._lastRadarLine = null;
+          const vals = line.split(',');
+          if(vals.length>=4){ 
+            targetX=parseFloat(vals[0]); 
+            targetY=parseFloat(vals[1]); 
+            speed=parseFloat(vals[2]); 
+            acceleration=parseFloat(vals[3]); 
+            const distance = Math.sqrt(targetX*targetX + targetY*targetY);
+            currentZone = calculateZone(distance);
+            
+                      radarTrail.push(p.createVector(targetX, targetY));
+            if (radarTrail.length > RADAR_TRAIL_MAX) radarTrail.shift();
+          }
+        }
+        
+        filteredX = alpha*targetX + (1-alpha)*filteredX;
+        filteredY = alpha*targetY + (1-alpha)*filteredY;
+
+        if(positionTrail.length>0){
+          const lastPos = positionTrail[positionTrail.length-1];
+          const distance = p.dist(filteredX,filteredY,lastPos.x,lastPos.y);
+          if(distance > movementThreshold){ 
+            positionTrail.push(p.createVector(filteredX,filteredY)); 
+            speedTrail.push(speed||0);
+            yDirectionTrail.push(filteredY);
+          }
+        } else { 
+          positionTrail.push(p.createVector(filteredX,filteredY)); 
+          speedTrail.push(speed||0);
+          yDirectionTrail.push(filteredY);
+        }
+
+        if(positionTrail.length >= maxTrailLength) analyzeBehaviorLocal();
+      };
+    });
+  </script>
+</body>
+</html>
+
+
