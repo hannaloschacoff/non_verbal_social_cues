@@ -1,0 +1,649 @@
+//in the ReadMe file there is a list of the electronic components needed
+//there is also a schematic on how to set up the hardware
+
+#include <Arduino.h>
+#include "RadarSensor.h"
+#include "INA3221.h"
+#include <ESP32Servo.h>
+
+#define RADAR_PIN_TX 16
+#define RADAR_PIN_RX 17
+#define SERVO_SCAN_PIN 32 //neck of prototype
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define SERVO1_PIN 27  // uncomfortable response
+#define SERVO3_PIN 19  // scared response
+#define SERVO4_PIN 13  // scared response
+
+//the thresholds should be manually calibrated
+#define CURRENT_THRESHOLD1 1300
+#define CURRENT_THRESHOLD3 700
+#define CURRENT_THRESHOLD4 1450
+#define NEUTRAL 1500
+#define SPEED_FORWARD 1300
+#define SPEED_REVERSE 1700
+#define MOVE_DURATION 2000
+
+// distance threshold for servo triggers (90cm = 900mm)
+#define SERVO_TRIGGER_DISTANCE 900.0
+
+RadarSensor radar;
+Servo servoScan, servo1, servo3, servo4;
+INA3221 inaVCC(INA3221_ADDR41_VCC);
+INA3221 ina(INA3221_ADDR40_GND);
+
+float filteredSpeed = 0;
+float previousSpeed = 0;
+float alpha = 0.2;
+float currentDistance = 0;
+
+String gazeDirection = "";
+String proxemicsInterpretation = "";
+int currentDegree = 45;
+
+bool systemPaused = false;
+bool isForward1 = true;
+bool isForward3 = true;
+bool isForward4 = true;
+
+// interaction state variables, state logic
+String approachValence = "";
+String awayValence = "";
+int gazeFollowCount = 0;
+const int MAX_GAZE_FOLLOW = 10;
+bool personInFrame = false;
+bool personStill = false;
+
+enum RobotState { 
+    WAITING_APPROACH,
+    GAZE_FOLLOWING,
+    REJECTION_HOLD,
+    SURPRISE_REACTION,
+    CHECKING_MOVEMENT
+};
+
+RobotState currentState = WAITING_APPROACH;
+
+void moveServoSmart(Servo &servo, bool &isForward, INA3221 &sensor, int channel, float threshold, unsigned long durationMs, const char* label, int maxCycles = 1);
+void updateRadar();
+void checkSerialInput();
+void smoothTurn(int targetAngle);
+void runStateMachine();
+void handleWaitingApproach();
+void handleGazeFollowing();
+void handleRejectionHold();
+void handleSurpriseReaction();
+void handleCheckingMovement();
+void resetInteraction();
+void enterPauseMode();
+void exitPauseMode();
+
+void setup() {
+    Serial.begin(115200);
+    radar.begin(RADAR_PIN_RX, RADAR_PIN_TX, 256000);
+    
+    Wire.begin(SDA_PIN, SCL_PIN);
+    inaVCC.begin(&Wire);
+    inaVCC.reset();
+    ina.begin(&Wire);
+    ina.reset();
+    
+    servoScan.attach(SERVO_SCAN_PIN);
+    servoScan.write(45);
+    currentDegree = 45;
+    
+    servo1.attach(SERVO1_PIN);
+    servo3.attach(SERVO3_PIN);
+    servo4.attach(SERVO4_PIN);
+    servo1.writeMicroseconds(NEUTRAL);
+    servo3.writeMicroseconds(NEUTRAL);
+    servo4.writeMicroseconds(NEUTRAL);
+    
+    Serial.println("\n========================================");
+    Serial.println("      EYE TRACKING ROBOT READY");
+    Serial.println("========================================");
+    Serial.println("Rest position: 45°");
+    Serial.println("Servo1 (pin 27, CH3) = Uncomfortable (>90cm)");
+    Serial.println("Servo3 (pin 19, CH2) = Scared (>90cm)");
+    Serial.println("Gaze: LIVE immediate response mode");
+    Serial.println("\nType 'help' for test commands");
+    Serial.println("========================================");
+    Serial.println("Waiting for person to approach...\n");
+    
+    delay(100);
+}
+
+void loop() {
+    // moveServoSmart(servo1, isForward1, inaVCC, INA3221_CH3, CURRENT_THRESHOLD1, MOVE_DURATION, "Servo1-UNCOMFORTABLE", 2);
+    if (!systemPaused) {
+        updateRadar();
+    }
+    
+    checkSerialInput();
+    
+    if (!systemPaused) {
+        runStateMachine();
+    }
+    
+    delay(20);
+}
+
+void updateRadar() {
+    radar.update();
+    RadarTarget tgt = radar.getTarget(0);
+    if (tgt.detected) {
+        filteredSpeed = alpha * tgt.speed + (1 - alpha) * filteredSpeed;
+        float acceleration = filteredSpeed - previousSpeed;
+        previousSpeed = filteredSpeed;
+        
+        personInFrame = true;
+        personStill = (abs(filteredSpeed) < 5.0);
+        
+        // Calculate distance
+        currentDistance = sqrt(tgt.x * tgt.x + tgt.y * tgt.y);
+        
+        Serial.print(static_cast<int>(tgt.x));
+        Serial.print(",");
+        Serial.print(static_cast<int>(tgt.y));
+        Serial.print(",");
+        Serial.print(filteredSpeed, 1);
+        Serial.print(",");
+        Serial.println(acceleration, 1);
+    } else {
+        personInFrame = false;
+        currentDistance = 0;
+    }
+}
+
+//Use Serial Monitor to test if motors are working
+void checkSerialInput() {
+    if (!Serial.available()) return;
+    
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    
+    String inputLower = input;
+    inputLower.toLowerCase();
+    
+    if (inputLower == "pause") {
+        enterPauseMode();
+        return;
+    }
+    else if (inputLower == "resume") {
+        exitPauseMode();
+        return;
+    }
+    
+    if (input.startsWith("gaze:")) {
+        gazeDirection = input.substring(5);
+        Serial.printf("[GAZE] Received LIVE: %s\n", gazeDirection.c_str());
+        return;
+    }
+    else if (input.startsWith("proxemics:")) {
+        proxemicsInterpretation = input.substring(10);
+        Serial.printf("PROXEMICS Received: %s | Distance: %.0fmm | State: %d\n", 
+                     proxemicsInterpretation.c_str(), currentDistance, currentState);
+        // DON'T trigger servos here - let state machine handle it
+        return;
+    }
+    
+    if (inputLower.startsWith("test")) {
+        if (inputLower == "test") {
+            Serial.println("\n========== MOTOR TEST MODE ==========");
+            Serial.println("Commands:");
+            Serial.println("  test1 - Test Servo 1 (Uncomfortable)");
+            Serial.println("  test4 - Test Servo 4 (Scared)");
+            Serial.println("  testscan - Test Scanner Servo");
+            Serial.println("=====================================\n");
+            return;
+        }
+        
+        if (inputLower == "test1") {
+            Serial.println("[TEST] Testing Servo 1 (Uncomfortable)");
+            moveServoSmart(servo1, isForward1, inaVCC, INA3221_CH3, CURRENT_THRESHOLD1, MOVE_DURATION, "Servo1-TEST", 1);
+            return;
+        }
+        else if (inputLower == "test4") {
+            Serial.println("[TEST] Testing Servo 4 (Scared)");
+            // moveServoSmart(servo3, isForward3, ina, INA3221_CH2, CURRENT_THRESHOLD3, MOVE_DURATION, "Servo3-TEST", 1);
+            return;
+        }
+        else if (inputLower == "testscan") {
+            Serial.println("[TEST] Testing Scanner Servo");
+            servoScan.write(0); delay(1000);
+            servoScan.write(45); delay(1000);
+            servoScan.write(90); delay(1000);
+            servoScan.write(45);
+            currentDegree = 45;
+            return;
+        }
+    }
+    
+    if (inputLower == "help" || inputLower == "?") {
+        Serial.println("\n========== COMMAND LIST ==========");
+        Serial.println("Motor Testing:");
+        Serial.println("  test1, test4, testscan");
+        Serial.println("\nSystem Commands:");
+        Serial.println("  PAUSE, RESUME");
+        Serial.println("==================================\n");
+    }
+}
+
+void runStateMachine() {
+    static unsigned long lastStateDebug = 0;
+    if (millis() - lastStateDebug > 1000) {
+        Serial.printf("DEBUG State: %d | Frame: %d | Dist: %.0f | Proxem: '%s' | Gaze: '%s'\n", 
+                      currentState, personInFrame, currentDistance, 
+                      proxemicsInterpretation.c_str(), gazeDirection.c_str());
+        lastStateDebug = millis();
+    }
+    
+    switch(currentState) {
+        case WAITING_APPROACH:
+            handleWaitingApproach();
+            break;
+        case GAZE_FOLLOWING:
+            handleGazeFollowing();
+            break;
+        case REJECTION_HOLD:
+            handleRejectionHold();
+            break;
+        case SURPRISE_REACTION:
+            handleSurpriseReaction();
+            break;
+        case CHECKING_MOVEMENT:
+            handleCheckingMovement();
+            break;
+    }
+}
+
+
+
+void handleWaitingApproach() {
+    if (!personInFrame) return;
+    
+    // CHECK: if person is close enough and detected, start interaction
+    if (currentDistance > 0 && currentDistance < 1500) { // Person within 1.5m
+        if (proxemicsInterpretation.indexOf("Angry") >= 0 || proxemicsInterpretation.indexOf("angry") >= 0) {
+            approachValence = "negative";
+            Serial.println("\n========================================");
+            Serial.println("[APPROACH] Detected ANGRY approach");
+            Serial.println("[APPROACH] Valence: NEGATIVE");
+            Serial.println("[STATE CHANGE] → GAZE_FOLLOWING (LIVE MODE)");
+            Serial.println("========================================\n");
+            gazeFollowCount = 0;
+            proxemicsInterpretation = "";
+            currentState = GAZE_FOLLOWING;
+            Serial.println("STATE:GAZE_FOLLOWING");
+            Serial.println("GAZE_COUNT:0");
+        }
+        else if (proxemicsInterpretation.indexOf("Curious") >= 0) {
+            approachValence = "positive";
+            Serial.println("\n========================================");
+            Serial.println("[APPROACH] Detected CURIOUS approach");
+            Serial.println("[APPROACH] Valence: POSITIVE");
+            Serial.println("[STATE CHANGE] → GAZE_FOLLOWING (LIVE MODE)");
+            Serial.println("========================================\n");
+            gazeFollowCount = 0;
+            proxemicsInterpretation = "";
+            currentState = GAZE_FOLLOWING;
+            Serial.println("STATE:GAZE_FOLLOWING");
+            Serial.println("GAZE_COUNT:0");       
+        }
+        // NEW: Allow standing still to trigger interaction
+        else if (proxemicsInterpretation.indexOf("Standing Still") >= 0) {
+            approachValence = "neutral";
+            Serial.println("\n========================================");
+            Serial.println("[APPROACH] Person STANDING STILL in frame");
+            Serial.println("[APPROACH] Valence: NEUTRAL");
+            Serial.println("[STATE CHANGE] → GAZE_FOLLOWING (LIVE MODE)");
+            Serial.println("========================================\n");
+            gazeFollowCount = 0;
+            proxemicsInterpretation = "";
+            currentState = GAZE_FOLLOWING;
+            Serial.println("STATE:GAZE_FOLLOWING");
+            Serial.println("GAZE_COUNT:0");
+        }
+    }
+}
+
+void handleGazeFollowing() {
+    if (gazeFollowCount >= MAX_GAZE_FOLLOW) {
+        Serial.println("\n========================================");
+        Serial.printf("[GAZE] Completed %d gaze follows\n", MAX_GAZE_FOLLOW);
+        
+        Serial.println("[GAZE] Returning to 45° to check final gaze");
+        smoothTurn(45);
+        Serial.println("[GAZE] Waiting 1 second for stable gaze...");
+        
+        for(int i = 0; i < 10; i++) { updateRadar(); delay(100); }
+        
+        Serial.printf("[GAZE] Final gaze: %s\n", gazeDirection.c_str());
+        
+        if (gazeDirection.indexOf("distracted") >= 0 || gazeDirection.indexOf("another person") >= 0) {
+            Serial.println("[GAZE] Person STILL looking away");
+            Serial.println("[STATE CHANGE] → REJECTION_HOLD");
+            Serial.println("========================================\n");
+            currentState = REJECTION_HOLD;
+            Serial.println("STATE:REJECTION_HOLD");
+        } else if (gazeDirection.indexOf("paying attention") >= 0) {
+            Serial.println("[GAZE] Person IS paying attention");
+            Serial.println("[STATE CHANGE] → SURPRISE_REACTION");
+            Serial.println("========================================\n");
+            currentState = SURPRISE_REACTION;
+            Serial.println("STATE:SURPRISE_REACTION");
+        } else {
+            Serial.println("[GAZE] No clear gaze - defaulting to REJECTION");
+            Serial.println("[STATE CHANGE] → REJECTION_HOLD");
+            Serial.println("========================================\n");
+            currentState = REJECTION_HOLD;
+            Serial.println("STATE:REJECTION_HOLD");
+        }
+        return;
+    }
+    
+    Serial.printf("\n[LIVE GAZE FOLLOW %d/%d]\n", gazeFollowCount + 1, MAX_GAZE_FOLLOW);
+    
+    // step 1: rreturn to rest position
+    Serial.println("[STEP 1] Moving to rest position (45°)");
+    if (gazeFollowCount < 5) {
+        // First 5: slow smooth turn
+        smoothTurn(45);
+    } else {
+        // Last 5: fast turn
+        servoScan.write(45);
+        currentDegree = 45;
+        for(int i = 0; i < 2; i++) { updateRadar(); delay(10); }
+    }
+    
+    // step 2: wait at rest position before checking gaze
+    Serial.println("[STEP 2] Waiting 1 second at rest for stable gaze...");
+    for(int i = 0; i < 10; i++) { updateRadar(); delay(100); }
+    
+    // step 3: Now check gaze direction
+    Serial.printf("[STEP 3] LIVE Gaze: %s\n", gazeDirection.c_str());
+    
+    // check: if person keeps paying attention, trigger surprise early
+    if (gazeDirection.indexOf("paying attention") >= 0) {
+        Serial.println("[GAZE] Person keeps paying attention!");
+        Serial.printf("[GAZE] Count: %d/%d - checking if should trigger surprise...\n", gazeFollowCount + 1, MAX_GAZE_FOLLOW);
+        
+        // If we've done at least 3 follows and they're still paying attention, trigger surprise
+        if (gazeFollowCount >= 2) {
+            Serial.println("[GAZE] ✓ Person consistently paying attention → SURPRISE!");
+            Serial.println("[STATE CHANGE] → SURPRISE_REACTION");
+            currentState = SURPRISE_REACTION;
+            Serial.println("STATE:SURPRISE_REACTION");
+            return;
+        } else {
+            Serial.println("[STEP 4] Paying attention → Staying at 45°");
+            for(int i = 0; i < 5; i++) { updateRadar(); delay(100); }
+            gazeFollowCount++;
+            Serial.printf("GAZE_COUNT:%d\n", gazeFollowCount);
+            return;
+        }
+    }
+    
+    // step 4: respond to gaze direction
+    int targetAngle = 45; // Default stay at center
+    
+    if (gazeDirection.indexOf("distracted left") >= 0) {
+        Serial.println("[STEP 4] Distracted LEFT → 22°");
+        targetAngle = 22;
+    }
+    else if (gazeDirection.indexOf("another person left") >= 0) {
+        Serial.println("[STEP 4] Another person LEFT → 0°");
+        targetAngle = 0;
+    }
+    else if (gazeDirection.indexOf("another person right") >= 0) {
+        Serial.println("[STEP 4] Another person RIGHT → 90°");
+        targetAngle = 90;
+    }
+    else if (gazeDirection.indexOf("distracted right") >= 0) {
+        Serial.println("[STEP 4] Distracted RIGHT → 67°");
+        targetAngle = 67;
+    }
+    else {
+        Serial.println("[STEP 4] No clear gaze data → Waiting...");
+        for(int i = 0; i < 10; i++) { updateRadar(); delay(100); }
+        return; // Don't increment counter if no valid gaze
+    }
+    
+    // execute turn based on count (first 5 = slow, last 5 = fast)
+    if (gazeFollowCount < 5) {
+        // First 5 turns: SLOW smooth turning
+        Serial.println("[TURN MODE] SLOW (smooth turn)");
+        smoothTurn(targetAngle);
+        for(int i = 0; i < 10; i++) { updateRadar(); delay(100); } // Extra wait after slow turn
+    } else {
+        // Last 5 turns: FAST turning
+        Serial.println("[TURN MODE] FAST (instant turn)");
+        servoScan.write(targetAngle);
+        currentDegree = targetAngle;
+        for(int i = 0; i < 3; i++) { updateRadar(); delay(10); } // Short wait after fast turn
+    }
+    
+    gazeFollowCount++;
+}
+
+void handleRejectionHold() {
+    Serial.println("\n========================================");
+    Serial.printf("[REJECTION] Approach was: %s\n", approachValence.c_str());
+    Serial.println("[REJECTION] Turning to rejection (180°)");
+    smoothTurn(180);
+    
+    int holdDuration = (approachValence == "positive") ? 4000 : 10000;
+    Serial.printf("[REJECTION] Holding %d seconds\n", holdDuration/1000);
+    Serial.println("========================================\n");
+    
+    for(int i = 0; i < holdDuration/100; i++) { updateRadar(); delay(100); }
+    
+    Serial.println("[REJECTION] Hold complete - Returning to rest (45°)");
+    smoothTurn(45);
+    
+    Serial.println("[STATE CHANGE] → CHECKING_MOVEMENT\n");
+    currentState = CHECKING_MOVEMENT;
+    Serial.println("STATE:CHECKING_MOVEMENT");
+}
+
+void handleSurpriseReaction() {
+    Serial.println("\n========================================");
+    Serial.println("[SURPRISE] Executing fast shake");
+    Serial.println("========================================\n");
+    
+    int shakeOffset = 40;
+    int delayTime = 150;
+    int startPos = currentDegree;
+    
+    servoScan.write(startPos - shakeOffset); currentDegree = startPos - shakeOffset;
+    for(int i = 0; i < delayTime/20; i++) { updateRadar(); delay(20); }
+    
+    servoScan.write(startPos + shakeOffset); currentDegree = startPos + shakeOffset;
+    for(int i = 0; i < delayTime/20; i++) { updateRadar(); delay(20); }
+    
+    servoScan.write(startPos - shakeOffset); currentDegree = startPos - shakeOffset;
+    for(int i = 0; i < delayTime/20; i++) { updateRadar(); delay(20); }
+    
+    servoScan.write(45); currentDegree = 45;
+    for(int i = 0; i < delayTime/20; i++) { updateRadar(); delay(20); }
+    
+    Serial.println("[SURPRISE] Complete!");
+    Serial.println("[STATE CHANGE] → CHECKING_MOVEMENT\n");
+    currentState = CHECKING_MOVEMENT;
+    Serial.println("STATE:CHECKING_MOVEMENT");
+}
+
+void handleCheckingMovement() {
+    Serial.println("\n========================================");
+    Serial.println("[CHECKING MOVEMENT] Analyzing behavior...");
+    Serial.printf("[CHECKING] Still: %d | InFrame: %d | Distance: %.0fmm\n", 
+                  personStill, personInFrame, currentDistance);
+    Serial.println("========================================\n");
+    
+    for(int i = 0; i < 20; i++) { updateRadar(); delay(100); }
+    
+    if (!personInFrame) {
+        Serial.println("[CHECKING] Person left frame");
+        Serial.println("[RESET] → WAITING_APPROACH\n");
+        resetInteraction();
+        return;
+    }
+    
+
+    if (proxemicsInterpretation.indexOf("Scared") >= 0 || proxemicsInterpretation.indexOf("Uncomfortable") >= 0) {
+        if (currentDistance > SERVO_TRIGGER_DISTANCE) {
+            if (proxemicsInterpretation.indexOf("Scared") >= 0) {
+                Serial.printf("\n!!! SCARED (%.0fmm > 900mm) - TRIGGERING SERVO3 !!!\n", currentDistance);
+                // moveServoSmart(servo3, isForward3, ina, INA3221_CH2, CURRENT_THRESHOLD3, MOVE_DURATION, "Servo3-SCARED", 2);
+                moveServoSmart(servo1, isForward1, inaVCC, INA3221_CH3, CURRENT_THRESHOLD1, MOVE_DURATION, "Servo1-UNCOMFORTABLE", 2);
+                proxemicsInterpretation = "";
+                
+                // SHORT wait then immediately restart interaction
+                Serial.println("[SERVO COMPLETE] Waiting 0.5s then back to GAZE_FOLLOWING");
+                for(int i = 0; i < 5; i++) { updateRadar(); delay(100); }
+                
+                gazeFollowCount = 0;
+                currentState = GAZE_FOLLOWING;
+                Serial.println("STATE:GAZE_FOLLOWING");
+                Serial.println("GAZE_COUNT:0");
+                return;
+            }
+            else if (proxemicsInterpretation.indexOf("Uncomfortable") >= 0) {
+                Serial.printf("\n!!! UNCOMFORTABLE (%.0fmm > 900mm) - TRIGGERING SERVO1 !!!\n", currentDistance);
+                moveServoSmart(servo1, isForward1, inaVCC, INA3221_CH3, CURRENT_THRESHOLD1, MOVE_DURATION, "Servo1-UNCOMFORTABLE", 2);
+                proxemicsInterpretation = "";
+                
+                // SHORT wait then immediately restart interaction
+                Serial.println("[SERVO COMPLETE] Waiting 0.5s then back to GAZE_FOLLOWING");
+                for(int i = 0; i < 5; i++) { updateRadar(); delay(100); }
+                
+                gazeFollowCount = 0;
+                currentState = GAZE_FOLLOWING;
+                Serial.println("STATE:GAZE_FOLLOWING");
+                Serial.println("GAZE_COUNT:0");
+                return;
+            }
+        } else {
+            Serial.printf("[SERVO SKIP] Too close (%.0fmm < 900mm)\n", currentDistance);
+            proxemicsInterpretation = "";
+        }
+    }
+    
+    if (personStill) {
+        Serial.println("[CHECKING] Person STANDING STILL");
+        Serial.println("[STATE CHANGE] → GAZE_FOLLOWING");
+        gazeFollowCount = 0;
+        currentState = GAZE_FOLLOWING;
+        Serial.println("STATE:GAZE_FOLLOWING");
+        Serial.println("GAZE_COUNT:0");
+        return;
+    }
+    
+    if (proxemicsInterpretation.indexOf("Curious") >= 0 || proxemicsInterpretation.indexOf("Angry") >= 0) {
+        Serial.println("[CHECKING] Person moving FORWARD");
+        Serial.println("[STATE CHANGE] → GAZE_FOLLOWING");
+        gazeFollowCount = 0;
+        proxemicsInterpretation = "";
+        currentState = GAZE_FOLLOWING;
+        Serial.println("STATE:GAZE_FOLLOWING");
+        Serial.println("GAZE_COUNT:0");
+        return;
+    }
+    
+    Serial.println("[CHECKING] No clear movement - timeout");
+    Serial.println("[RESET] → WAITING_APPROACH\n");
+    resetInteraction();
+}
+
+void moveServoSmart(Servo &servo, bool &isForward, INA3221 &sensor, int channel, float threshold, unsigned long durationMs, const char* label, int maxCycles) {
+    int cycleCount = 0;
+    Serial.printf("[SMART] Starting %s\n", label);
+
+    while (cycleCount <= 1) {
+        updateRadar();
+        
+        float current = sensor.getCurrent((ina3221_ch_t)channel) * -1000;
+        float voltage = sensor.getVoltage((ina3221_ch_t)channel);
+
+        Serial.printf("[%s] %.2f mA | %.2f V | %s\n", 
+                      label, current, voltage, isForward ? "FWD" : "REV");
+
+        if (isnan(current) || isnan(voltage)) {
+            Serial.println("[ERROR] Sensor read error!");
+            break;
+        }
+
+        if (current > threshold) {
+            Serial.printf("[%s] Threshold exceeded - Reversing\n", label);
+            servo.writeMicroseconds(NEUTRAL); delay(50);
+            for(int i = 0; i < 5; i++) { updateRadar(); delay(100); }
+            servo.writeMicroseconds(SPEED_REVERSE);
+            for(int i = 0; i < 20; i++) { updateRadar(); delay(100); }
+            delay(200);
+            servo.writeMicroseconds(SPEED_FORWARD);
+            for(int i = 0; i < 10; i++) { updateRadar(); delay(100); }
+            delay(100);
+            cycleCount++;
+        } else {
+            servo.writeMicroseconds(isForward ? SPEED_FORWARD : SPEED_REVERSE);
+        }
+        delay(500);
+        for(int i = 0; i < 5; i++) { updateRadar(); delay(100); }
+    }
+    servo.writeMicroseconds(NEUTRAL);
+    Serial.printf("[SMART] %s complete\n", label);
+}
+
+void resetInteraction() {
+    Serial.println("\n******** INTERACTION RESET ********");
+    Serial.printf("Previous approach: %s\n", approachValence.c_str());
+    
+    approachValence = "";
+    awayValence = "";
+    gazeFollowCount = 0;
+    proxemicsInterpretation = "";
+    gazeDirection = "";
+    
+    smoothTurn(45);
+    currentState = WAITING_APPROACH;
+    Serial.println("STATE:WAITING_APPROACH");
+    
+    Serial.println("Ready for new person");
+    Serial.println("***********************************\n");
+}
+
+void smoothTurn(int targetAngle) {
+    if (currentDegree == targetAngle) return;
+    
+    Serial.printf("[SERVO] %d° → %d°\n", currentDegree, targetAngle);
+    
+    int step = (targetAngle > currentDegree) ? 2 : -2;
+    while (abs(currentDegree - targetAngle) > 2) {
+        currentDegree += step;
+        servoScan.write(currentDegree);
+        updateRadar();
+        delay(15); // CHANGED: Was 10ms, now 15ms for smoother slow turns
+    }
+    
+    servoScan.write(targetAngle);
+    currentDegree = targetAngle;
+    Serial.printf("[SERVO] Reached %d°\n", currentDegree);
+}
+
+void enterPauseMode() {
+    systemPaused = true;
+    Serial.println("\n====================================");
+    Serial.println("===== SYSTEM PAUSED =====");
+    Serial.println("====================================");
+    smoothTurn(45);
+    Serial.println("[PAUSE] Robot stationary\n");
+}
+
+void exitPauseMode() {
+    systemPaused = false;
+    Serial.println("\n====================================");
+    Serial.println("===== SYSTEM RESUMED =====");
+    Serial.println("====================================");
+    resetInteraction();
+    Serial.println("[RESUME] Robot active\n");
+}
