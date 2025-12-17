@@ -37,6 +37,7 @@ What you need (Electronics):
 4. 2x S3003 Servo - 6kg - Continuous (https://www.tinytronics.nl/nl/mechanica-en-actuatoren/motoren/servomotoren/s3003-servo-6kg-continuous)
 5. Ai-Thinker Rd-03D 24GHz Radar Sensor Module (https://www.tinytronics.nl/nl/sensoren/beweging/ai-thinker-rd-03d-24ghz-radar-sensor-module)
 6. INA3221 I2C DC Stroom - en Spanningssensor Module - 1.6A - 3 Kanalen (https://www.tinytronics.nl/nl/sensoren/stroom-spanning/ina3221-i2c-dc-stroom-en-spanningssensor-module-1.6a-3-kanalen)
+7. A external webcam
 A schematic of how to connect the electronics can be found in the repository,
 
 What you need (Mechanisms)- 3D print them from the download folder:
