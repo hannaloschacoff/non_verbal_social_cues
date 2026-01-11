@@ -1,6 +1,8 @@
 //in the ReadMe file there is a list of the electronic components needed
 //there is also a schematic on how to set up the hardware
 
+//the radar sensor data handling section is written by Nirvana van Hees
+
 #include <Arduino.h>
 #include "RadarSensor.h"
 #include "INA3221.h"
