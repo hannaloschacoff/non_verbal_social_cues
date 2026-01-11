@@ -3,7 +3,7 @@ More information on project: https://projects.id.tue.nl/demoday/WVI7EE
 See portfolio: www.hannaloschacoff.com
 
 This project has three software elements:
-1. Index.html (Front-end visualizing data input and perspective of robot)
+1. Index.html (Front-end visualizing data input and perspective of robot), the orientation of the visualization is vertical
 2. Server.js (Javascript file sending and receiving data through serial communication)
 3. Through_your_eyes.ino (ESP32 file resulting in robot reaction with movement)
 
