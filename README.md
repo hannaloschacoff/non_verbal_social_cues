@@ -49,4 +49,4 @@ What you need (Casing)
 1. 11m Aluminium Stanley Profile by Item
 2. 3x 700x400x2mm MDF plates
 3. 1x Cardboard cat toy (https://www.bol.com/nl/nl/p/opvouwbare-krabpaal-kattenspeelgoed-kattenspeeltjes-2-in-1-kattenspeelgoed-krabhuis-voor-katten-met-bellenbal-draagbare-krabpaal-voor-katten/9300000237265371/?Referrer=ADVNLGOO002041-S--9300000237265371-PMAX-C-22294751171&gad_source=1&gad_campaignid=22298487985&gbraid=0AAAAAD5OnmOrczGYXDRYsop85qnTNeIVW&gclid=Cj0KCQiAxonKBhC1ARIsAIHq_lsoz6fFqy_Zmz80PzEYDPPxNsxXXYirF5QMlXVqzFxcatytuAMfGhEaArOUEALw_wcB)
-4. 27 Inch monitor screen (USE IN LANDSCAPE DISPLAY)
+4. 27 Inch monitor screen (USE IN PORTRAIT MODE)
